@@ -1,0 +1,12 @@
+**/target/
+.local/
+.env
+*.log
+.DS_Store
+.idea/
+*.iml
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform.tfvars
