@@ -1,248 +1,28 @@
+services:
 
-name: CI-CD Cloud Native Semana 3
+  storage-service:
+    image: ${DOCKERHUB_USER}/cloudnative-storage:${IMAGE_TAG}
+    container_name: cloudnative-storage
+    environment:
+      S3_BUCKET: ${S3_BUCKET}
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN}
+      EFS_PATH: /mnt/efs
+    volumes:
+      - /mnt/efs:/mnt/efs
+    expose:
+      - "8081"
+    restart: unless-stopped
 
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: semana3-deploy-ec2
-  cancel-in-progress: false
-
-jobs:
-  verify:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Descargar repositorio
-        uses: actions/checkout@v4
-
-      - name: Configurar Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: maven
-
-      - name: Pruebas unitarias y compilacion
-        run: mvn -B -ntp clean verify
-
-      - name: Guardar artefactos Maven
-        uses: actions/upload-artifact@v4
-        with:
-          name: maven-artifacts
-          path: |
-            document-service/target/*.jar
-            storage-service/target/*.jar
-          retention-days: 1
-          if-no-files-found: error
-
-  publish:
-    needs: verify
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Descargar repositorio
-        uses: actions/checkout@v4
-
-      - name: Recuperar artefactos
-        uses: actions/download-artifact@v4
-        with:
-          name: maven-artifacts
-          path: .
-
-      - name: Configurar QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Configurar Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Autenticarse en Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Publicar document-service
-        uses: docker/build-push-action@v6
-        with:
-          context: ./document-service
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/cloudnative-documents:${{ github.sha }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/cloudnative-documents:latest
-
-      - name: Publicar storage-service
-        uses: docker/build-push-action@v6
-        with:
-          context: ./storage-service
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/cloudnative-storage:${{ github.sha }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/cloudnative-storage:latest
-
-  deploy:
-    needs: publish
-    runs-on: ubuntu-latest
-    environment: aws-demo
-
-    steps:
-      - name: Descargar repositorio
-        uses: actions/checkout@v4
-
-      - name: Comprobar credenciales AWS Learner Lab y S3
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-        run: |
-          set -euo pipefail
-
-          test -n "$AWS_ACCESS_KEY_ID"
-          test -n "$AWS_SECRET_ACCESS_KEY"
-          test -n "$AWS_SESSION_TOKEN"
-          test -n "$AWS_DEFAULT_REGION"
-          test -n "$S3_BUCKET"
-
-          aws sts get-caller-identity \
-            --query Arn --output text
-
-          aws s3api head-bucket \
-            --bucket "$S3_BUCKET"
-
-      - name: Copiar Docker Compose a EC2
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          source: docker-compose.aws.yml
-          target: ~/cloudnative
-
-      - name: Desplegar microservicios por SSH
-        uses: appleboy/ssh-action@v1.0.3
-        env:
-          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          IMAGE_TAG: ${{ github.sha }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
-          envs: DOCKERHUB_USER,DOCKERHUB_TOKEN,IMAGE_TAG,AWS_REGION,S3_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN
-          command_timeout: 15m
-          script: |
-            set -eu
-            umask 077
-
-            cd ~/cloudnative
-
-            echo "1. Verificando montaje de Amazon EFS"
-
-            mountpoint -q /mnt/efs || {
-              echo "ERROR: EFS no esta montado en /mnt/efs"
-              exit 1
-            }
-
-            echo "2. Corrigiendo permisos de Amazon EFS"
-
-            sudo chown 999:999 /mnt/efs
-            sudo chmod 750 /mnt/efs
-
-            echo "Permisos de EFS configurados"
-
-            ls -ldn /mnt/efs
-
-            echo "3. Creando configuracion de entorno"
-
-            printf 'DOCKERHUB_USER=%s\nIMAGE_TAG=%s\nAWS_REGION=%s\nS3_BUCKET=%s\nAWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\nAWS_SESSION_TOKEN=%s\n' \
-              "$DOCKERHUB_USER" \
-              "$IMAGE_TAG" \
-              "$AWS_REGION" \
-              "$S3_BUCKET" \
-              "$AWS_ACCESS_KEY_ID" \
-              "$AWS_SECRET_ACCESS_KEY" \
-              "$AWS_SESSION_TOKEN" > .env.tmp
-
-            chmod 600 .env.tmp
-            mv .env.tmp .env
-
-            echo "4. Autenticando Docker Hub"
-
-            printf '%s' "$DOCKERHUB_TOKEN" | \
-              docker login \
-                -u "$DOCKERHUB_USER" \
-                --password-stdin >/dev/null
-
-            echo "5. Validando Docker Compose"
-
-            docker compose \
-              --env-file .env \
-              -f docker-compose.aws.yml \
-              config --quiet
-
-            echo "6. Descargando imagenes ARM64"
-
-            docker compose \
-              --env-file .env \
-              -f docker-compose.aws.yml \
-              pull
-
-            echo "7. Desplegando microservicios"
-
-            docker compose \
-              --env-file .env \
-              -f docker-compose.aws.yml \
-              up -d --remove-orphans
-
-            echo "8. Estado de contenedores"
-
-            docker compose \
-              --env-file .env \
-              -f docker-compose.aws.yml \
-              ps
-
-            echo "9. Verificando permisos de escritura en EFS"
-
-            docker exec cloudnative-storage \
-              sh -c 'touch /mnt/efs/.prueba-cicd && rm /mnt/efs/.prueba-cicd' || {
-                echo "ERROR: storage-service no tiene permisos de escritura en EFS"
-                docker logs cloudnative-storage --tail 50
-                exit 1
-              }
-
-            echo "Escritura en EFS verificada correctamente"
-
-            echo "10. Verificando servicio de documentos"
-
-            for attempt in $(seq 1 35); do
-              if curl -fsS \
-                http://127.0.0.1:8080/api/health; then
-                echo ""
-                echo "Despliegue completado correctamente"
-                exit 0
-              fi
-              sleep 5
-            done
-
-            echo "ERROR: La aplicacion no responde"
-
-            docker compose \
-              --env-file .env \
-              -f docker-compose.aws.yml \
-              logs --tail=60
-
-            exit 1
+  document-service:
+    image: ${DOCKERHUB_USER}/cloudnative-documents:${IMAGE_TAG}
+    container_name: cloudnative-documents
+    environment:
+      STORAGE_SERVICE_URL: http://storage-service:8081
+    ports:
+      - "8080:8080"
+    depends_on:
+      - storage-service
+    restart: unless-stopped
